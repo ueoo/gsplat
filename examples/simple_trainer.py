@@ -440,8 +440,8 @@ class Runner:
             ]
 
         # Losses & Metrics.
-        # self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        # self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         # Viewer
         if not self.cfg.disable_viewer:
