@@ -96,7 +96,7 @@ class Config:
     # Initialization strategy
     init_type: Literal["sfm", "random"] = "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
+    init_num_pts: int = 10000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
@@ -1138,10 +1138,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         print("Setting / overriding config settings for blender data")
         print("Forcing init type to random")
         cfg.init_type = "random"
-        print("Setting near and far to Blender data recommended settings (2 and 6, respectively)")
+        print("Setting near and far to 0.1 and 4.0.")
+        # print(
+        #     "Setting near and far to Blender data recommended settings (2 and 6, respectively)"
+        # )
         # Taken from nerfbaselines setting
-        cfg.near_plane = 2.0
-        cfg.far_plane = 6.0
+        cfg.near_plane = 0.1
+        cfg.far_plane = 4.0
         print("Setting init_extent to 0.5")
         # Taken from nerfbaselines setting
         cfg.init_extent = 0.5
