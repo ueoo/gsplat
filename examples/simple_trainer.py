@@ -216,7 +216,15 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        # Generate points uniformly distributed in a sphere
+        points = torch.randn((init_num_pts, 3))  # Generate points in 3D space
+        points = F.normalize(points, p=2, dim=1)  # Normalize to unit sphere surface
+        # Scale by random radius to fill sphere uniformly
+        radius = torch.rand((init_num_pts, 1)) ** (
+            1 / 3
+        )  # Cube root for uniform distribution
+        points = points * radius  # Scale points to fill sphere
+        points = init_extent * scene_scale * points  # Apply scene scaling
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
@@ -338,6 +346,7 @@ class Runner:
             # using `test` over `val` for evaluation - following same convention as in https://nerfbaselines.github.io/
             self.valset = Dataset(cfg.data_dir, split="test")
             self.scene_scale = self.trainset.scene_scale * 1.1 * cfg.global_scale
+            print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -1018,7 +1027,7 @@ class Runner:
             height = self.trainset.image_height
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
+                camtoworlds_all, 5, rot_weight=1.0
             )  # [N, 3, 4]
         elif cfg.render_traj_path == "ellipse":
             height = camtoworlds_all[:, 2, 3].mean()
@@ -1131,7 +1140,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         #     "Setting near and far to Blender data recommended settings (2 and 6, respectively)"
         # )
         # Taken from nerfbaselines setting
-        cfg.near_plane = 0.1
+        cfg.near_plane = 1.0
         cfg.far_plane = 4.0
         print("Setting init_extent to 0.5")
         # Taken from nerfbaselines setting
