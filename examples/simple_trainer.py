@@ -86,22 +86,22 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 20_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [20_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [20_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [20_000])
 
     # Initialization strategy
     init_type: Literal["sfm", "random"] = "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 10000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
+    init_extent: float = 1.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -140,6 +140,10 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # Anisotropic regularization weight
+    aniso_reg: float = 0.0
+    # Maximum allowed ratio between major and minor axis lengths
+    aniso_max_ratio: float = 2
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -170,7 +174,7 @@ class Config:
     depth_lambda: float = 1e-2
 
     # Dump information to tensorboard every this steps
-    tb_every: int = 100
+    tb_every: int = 1000
     # Save training images to tensorboard
     tb_save_image: bool = False
 
@@ -710,7 +714,7 @@ class Runner:
                 loss += tvloss
 
             # regularizations
-            if cfg.opacity_reg > 0.0:
+            if cfg.opacity_reg > 0.0 and step > 10000:
                 loss = (
                     loss
                     + cfg.opacity_reg
@@ -721,6 +725,18 @@ class Runner:
                     loss
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
+            if cfg.aniso_reg > 0.0:
+                # Get the scales in 3D space
+                scales = torch.exp(self.splats["scales"])  # [N, 3]
+                # For each Gaussian, find the ratio between max and min scale
+                max_scales = scales.max(dim=1)[0]  # [N]
+                min_scales = scales.min(dim=1)[0]  # [N]
+                scale_ratios = max_scales / (min_scales + 1e-6)  # [N]
+                # Penalize ratios that exceed the maximum allowed ratio
+                aniso_loss = torch.clamp(
+                    scale_ratios - cfg.aniso_max_ratio, min=0.0
+                ).mean()
+                loss = loss + cfg.aniso_reg * aniso_loss
 
             loss.backward()
 
@@ -753,6 +769,8 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.aniso_reg > 0.0:
+                    self.writer.add_scalar("train/anisoloss", aniso_loss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1135,16 +1153,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         print("Setting / overriding config settings for blender data")
         print("Forcing init type to random")
         cfg.init_type = "random"
-        print("Setting near and far to 0.1 and 4.0.")
+        print("Setting near and far to 0.1 and 100.0.")
         # print(
         #     "Setting near and far to Blender data recommended settings (2 and 6, respectively)"
         # )
         # Taken from nerfbaselines setting
-        cfg.near_plane = 1.0
-        cfg.far_plane = 4.0
-        print("Setting init_extent to 0.5")
-        # Taken from nerfbaselines setting
-        cfg.init_extent = 0.5
+        cfg.near_plane = 0.1
+        cfg.far_plane = 100
 
         if cfg.render_traj_path == "spiral":
             print(
