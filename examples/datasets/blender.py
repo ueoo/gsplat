@@ -29,7 +29,11 @@ class Dataset:
             image_id = frame["file_path"].replace("./", "")
             image_ids.append(image_id)
             file_path = self.data_dir / f"{image_id}.png"
-            images.append(imageio.imread(file_path))
+            img = imageio.imread(file_path)
+            # Only keep the first 3 channels (RGB), removing alpha if it exists
+            if img.shape[-1] > 3:
+                img = img[..., :3]
+            images.append(img)
 
             c2w = torch.tensor(frame["transform_matrix"])
             # Convert from OpenGL to OpenCV coordinate system

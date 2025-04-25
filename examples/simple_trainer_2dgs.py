@@ -42,6 +42,8 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
+    # Type of the dataset (e.g. COLMAP or Blender)
+    data_type: Literal["colmap", "blender"] = "colmap"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -62,18 +64,18 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 20000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [1000, 20_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [1000, 20_000])
 
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
+    init_num_pts: int = 10000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
+    init_extent: float = 1.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -163,7 +165,7 @@ class Config:
     model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
 
     # Dump information to tensorboard every this steps
-    tb_every: int = 100
+    tb_every: int = 100000
     # Save training images to tensorboard
     tb_save_image: bool = False
 
@@ -196,7 +198,15 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        # Generate points uniformly distributed in a sphere
+        points = torch.randn((init_num_pts, 3))  # Generate points in 3D space
+        points = F.normalize(points, p=2, dim=1)  # Normalize to unit sphere surface
+        # Scale by random radius to fill sphere uniformly
+        radius = torch.rand((init_num_pts, 1)) ** (
+            1 / 3
+        )  # Cube root for uniform distribution
+        points = points * radius  # Scale points to fill sphere
+        points = init_extent * scene_scale * points  # Apply scene scaling
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
@@ -270,20 +280,29 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=True,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        if cfg.data_type == "colmap":
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=True,
+                test_every=cfg.test_every,
+            )
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = Dataset(self.parser, split="val")
+            self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        elif cfg.data_type == "blender":
+            from datasets.blender import Dataset
+
+            self.parser = None
+            self.trainset = Dataset(cfg.data_dir, split="train")
+            # using `test` over `val` for evaluation - following same convention as in https://nerfbaselines.github.io/
+            self.valset = Dataset(cfg.data_dir, split="test")
+            self.scene_scale = self.trainset.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
@@ -726,8 +745,9 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
-                self.eval(step)
-                self.render_traj(step)
+                # self.eval(step)
+                # self.render_traj(step)
+                pass
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -951,6 +971,14 @@ class Runner:
 
 
 def main(cfg: Config):
+    if cfg.data_type == "blender":
+        print("Setting / overriding config settings for blender data")
+        print("Forcing init type to random")
+        cfg.init_type = "random"
+        print("Setting near and far to 0.1 and 100.0.")
+        cfg.near_plane = 0.1
+        cfg.far_plane = 100
+
     runner = Runner(cfg)
 
     if cfg.ckpt is not None:
