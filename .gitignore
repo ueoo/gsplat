@@ -121,7 +121,11 @@ venv.bak/
 compile_commands.json
 *.dump
 
-data
+data/*
+!data/sim11_sparse_cameras_only3/
+!data/sim11_sparse_cameras_only2/
+!data/sim11_sparse_cameras/
+!data/sim12_bg_only/
 results
 
 !examples/benchmarks/compression/results/

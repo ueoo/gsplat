@@ -39,6 +39,8 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
+    # Path to background .pt file to load as non-optimizable background
+    load_background: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -324,6 +326,20 @@ class Runner:
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
 
+        # Load background gaussians if provided
+        self.background_splats = None
+        if cfg.load_background is not None:
+            print(f"Loading background from: {cfg.load_background}")
+            background_ckpt = torch.load(cfg.load_background, map_location=self.device)
+            self.background_splats = torch.nn.ParameterDict()
+            for k, v in background_ckpt["splats"].items():
+                # Make background non-optimizable by not wrapping in Parameter
+                self.background_splats[k] = v.to(self.device)
+            print(
+                "Background loaded. Number of background GS:",
+                len(self.background_splats["means"]),
+            )
+
         if self.model_type == "2dgs":
             key_for_gradient = "gradient_2dgs"
         else:
@@ -400,6 +416,117 @@ class Runner:
                 mode="training",
             )
 
+    def _filter_info_for_foreground_strategy(self, info: Dict, num_fg: int) -> Dict:
+        """Filter info dict to only contain foreground gaussian information for strategy operations.
+
+        This function should be called AFTER loss.backward() so that gradients are available
+        on the original tensors. It extracts only the foreground portion while preserving
+        gradient information.
+        """
+        if self.background_splats is None:
+            return info
+
+        total_gaussians = num_fg + len(self.background_splats["means"])
+        filtered_info = {}
+
+        # Known per-gaussian tensors that need filtering
+        per_gaussian_keys = {
+            "radii",
+            "means2d",
+            "conics",
+            "gradient_2dgs",
+            "depths",
+            "normals",
+            "opacities",
+            "means",
+            "scales",
+            "quats",
+            "colors",
+            "sh0",
+            "shN",
+        }
+
+        for key, value in info.items():
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                # Check if this tensor has per-gaussian information
+                is_per_gaussian = False
+
+                # Explicit check for known per-gaussian keys
+                if key in per_gaussian_keys:
+                    is_per_gaussian = True
+                # Check if any dimension matches total gaussians
+                elif any(dim == total_gaussians for dim in value.shape):
+                    is_per_gaussian = True
+
+                if is_per_gaussian:
+                    # Filter to only foreground gaussians
+                    if len(value.shape) >= 2 and value.shape[1] == total_gaussians:
+                        # Batch dimension first, gaussians second: [B, N, ...]
+                        filtered_tensor = value[:, :num_fg]
+                    elif len(value.shape) >= 1 and value.shape[0] == total_gaussians:
+                        # Gaussians first dimension: [N, ...]
+                        filtered_tensor = value[:num_fg]
+                    else:
+                        # Find the dimension that matches total_gaussians and slice it
+                        slices = []
+                        for i, dim_size in enumerate(value.shape):
+                            if dim_size == total_gaussians:
+                                slices.append(slice(None, num_fg))
+                                break
+                            else:
+                                slices.append(slice(None))
+                        filtered_tensor = value[tuple(slices)]
+
+                    # For gradient tensors, preserve gradient information
+                    if (
+                        key == "gradient_2dgs"
+                        and hasattr(value, "grad")
+                        and value.grad is not None
+                    ):
+                        # Extract the gradient for foreground gaussians
+                        if (
+                            len(value.grad.shape) >= 2
+                            and value.grad.shape[1] == total_gaussians
+                        ):
+                            fg_grad = value.grad[:, :num_fg]
+                        elif (
+                            len(value.grad.shape) >= 1
+                            and value.grad.shape[0] == total_gaussians
+                        ):
+                            fg_grad = value.grad[:num_fg]
+                        else:
+                            # Find the dimension that matches total_gaussians in gradients
+                            grad_slices = []
+                            for i, dim_size in enumerate(value.grad.shape):
+                                if dim_size == total_gaussians:
+                                    grad_slices.append(slice(None, num_fg))
+                                    break
+                                else:
+                                    grad_slices.append(slice(None))
+                            fg_grad = value.grad[tuple(grad_slices)]
+
+                        # Create a new tensor with gradient manually attached
+                        filtered_tensor = filtered_tensor.detach()
+                        filtered_tensor.requires_grad = True
+                        filtered_tensor.grad = fg_grad
+
+                    filtered_info[key] = filtered_tensor
+                else:
+                    # Keep non-per-gaussian tensors as is
+                    filtered_info[key] = value
+            else:
+                # Keep non-tensor values as is
+                filtered_info[key] = value
+
+        # Handle gaussian_ids if it exists - filter to only include foreground IDs
+        if "gaussian_ids" in info:
+            orig_ids = info["gaussian_ids"]
+            if isinstance(orig_ids, torch.Tensor):
+                fg_mask = orig_ids < num_fg
+                filtered_info["gaussian_ids"] = orig_ids[fg_mask]
+
+        return filtered_info
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -408,6 +535,7 @@ class Runner:
         height: int,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
+        # Foreground gaussians
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -427,6 +555,32 @@ class Runner:
             colors = torch.sigmoid(colors)
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+
+        # Combine with background gaussians if available
+        if self.background_splats is not None:
+            bg_means = self.background_splats["means"].detach()  # [M, 3]
+            bg_quats = self.background_splats["quats"].detach()  # [M, 4]
+            bg_scales = torch.exp(self.background_splats["scales"]).detach()  # [M, 3]
+            bg_opacities = torch.sigmoid(
+                self.background_splats["opacities"]
+            ).detach()  # [M,]
+
+            if self.cfg.app_opt:
+                # For background, use zero features or handle appropriately
+                bg_colors = torch.cat(
+                    [self.background_splats["sh0"], self.background_splats["shN"]], 1
+                ).detach()  # [M, K, 3]
+            else:
+                bg_colors = torch.cat(
+                    [self.background_splats["sh0"], self.background_splats["shN"]], 1
+                ).detach()  # [M, K, 3]
+
+            # Concatenate foreground and background
+            means = torch.cat([means, bg_means], dim=0)
+            quats = torch.cat([quats, bg_quats], dim=0)
+            scales = torch.cat([scales, bg_scales], dim=0)
+            opacities = torch.cat([opacities, bg_opacities], dim=0)
+            colors = torch.cat([colors, bg_colors], dim=0)
 
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
@@ -589,6 +743,7 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # Use full info for pre_backward so retain_grad works on original tensors
             self.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -596,6 +751,7 @@ class Runner:
                 step=step,
                 info=info,
             )
+
             masks = data["mask"].to(device) if "mask" in data else None
             if masks is not None:
                 pixels = pixels * masks[..., None]
@@ -652,6 +808,10 @@ class Runner:
 
             loss.backward()
 
+            # Now filter info for post_backward (gradients are available)
+            num_fg = len(self.splats["means"])
+            filtered_info = self._filter_info_for_foreground_strategy(info, num_fg)
+
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
@@ -687,29 +847,32 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
+            # Use filtered info for post_backward so strategy only sees foreground gaussians
             self.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
                 step=step,
-                info=info,
+                info=filtered_info,
                 packed=cfg.packed,
             )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
-                    )
+                gaussian_ids = filtered_info.get("gaussian_ids", None)
+
+                if gaussian_ids is not None:
+                    for k in self.splats.keys():
+                        grad = self.splats[k].grad
+                        if grad is None or grad.is_sparse:
+                            continue
+                        self.splats[k].grad = torch.sparse_coo_tensor(
+                            indices=gaussian_ids[None],  # [1, nnz]
+                            values=grad[gaussian_ids],  # [nnz, ...]
+                            size=self.splats[k].size(),  # [N, ...]
+                            is_coalesced=len(Ks) == 1,
+                        )
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -735,6 +898,8 @@ class Runner:
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
+
+                # Save foreground-only checkpoint
                 torch.save(
                     {
                         "step": step,
@@ -742,6 +907,32 @@ class Runner:
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
+
+                # Save full checkpoint (foreground + background)
+                if self.background_splats is not None:
+                    # Combine foreground and background splats
+                    full_splats = {}
+                    for key in self.splats.keys():
+                        full_splats[key] = torch.cat(
+                            [self.splats[key].data, self.background_splats[key]], dim=0
+                        )
+
+                    torch.save(
+                        {
+                            "step": step,
+                            "splats": full_splats,
+                        },
+                        f"{self.ckpt_dir}/ckpt_full_{step}.pt",
+                    )
+                else:
+                    # If no background, full checkpoint is same as foreground
+                    torch.save(
+                        {
+                            "step": step,
+                            "splats": self.splats.state_dict(),
+                        },
+                        f"{self.ckpt_dir}/ckpt_full_{step}.pt",
+                    )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
