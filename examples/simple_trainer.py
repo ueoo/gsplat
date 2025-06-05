@@ -15,7 +15,7 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Parser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -26,7 +26,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from fused_ssim import fused_ssim
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
@@ -36,8 +36,8 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat_viewer import GsplatViewer, GsplatRenderTabState
-from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gsplat.optimizers import SelectiveAdam
+from gsplat.utils import save_ply
 
 
 @dataclass
@@ -51,8 +51,10 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
+    # Path to the dataset
     data_dir: str = "data/360_v2/garden"
+    # Type of the dataset (e.g. COLMAP or Blender)
+    data_type: Literal["colmap", "blender"] = "colmap"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -77,24 +79,22 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 20_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [20_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [20_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to disable video generation during training and evaluation
-    disable_video: bool = False
+    ply_steps: List[int] = field(default_factory=lambda: [20_000])
 
     # Initialization strategy
-    init_type: str = "sfm"
+    init_type: Literal["sfm", "random"] = "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
+    init_num_pts: int = 10000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
+    init_extent: float = 1.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -124,26 +124,19 @@ class Config:
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
-    # Use random background for training to discourage transparency
+    # Use random background for training to encourage alpha consistency w/ source
     random_bkgd: bool = False
-
-    # LR for 3D point positions
-    means_lr: float = 1.6e-4
-    # LR for Gaussian scale factors
-    scales_lr: float = 5e-3
-    # LR for alpha blending weights
-    opacities_lr: float = 5e-2
-    # LR for orientation (quaternions)
-    quats_lr: float = 1e-3
-    # LR for SH band 0 (brightness)
-    sh0_lr: float = 2.5e-3
-    # LR for higher-order SH (detail)
-    shN_lr: float = 2.5e-3 / 20
+    # Fixed background color to use w/ transparent source images for evaluation (and training if random_bkgd is False)
+    bkgd_color: List[int] = field(default_factory=lambda: [255, 255, 255])
 
     # Opacity regularization
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # Anisotropic regularization weight
+    aniso_reg: float = 0.0
+    # Maximum allowed ratio between major and minor axis lengths
+    aniso_max_ratio: float = 2
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -174,18 +167,9 @@ class Config:
     depth_lambda: float = 1e-2
 
     # Dump information to tensorboard every this steps
-    tb_every: int = 100
+    tb_every: int = 1000
     # Save training images to tensorboard
     tb_save_image: bool = False
-
-    lpips_net: Literal["vgg", "alex"] = "alex"
-
-    # 3DGUT (uncented transform + eval 3D)
-    with_ut: bool = False
-    with_eval3d: bool = False
-
-    # Whether use fused-bilateral grid
-    use_fused_bilagrid: bool = False
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -209,7 +193,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser: Parser,
+    parser: Optional[Parser],
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -235,7 +219,15 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        # Generate points uniformly distributed in a sphere
+        points = torch.randn((init_num_pts, 3))  # Generate points in 3D space
+        points = F.normalize(points, p=2, dim=1)  # Normalize to unit sphere surface
+        # Scale by random radius to fill sphere uniformly
+        radius = torch.rand((init_num_pts, 1)) ** (
+            1 / 3
+        )  # Cube root for uniform distribution
+        points = points * radius  # Scale points to fill sphere
+        points = init_extent * scene_scale * points  # Apply scene scaling
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
@@ -330,22 +322,34 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
-        # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
+        if cfg.data_type == "colmap":
+            from datasets.colmap import Dataset
+
+            # Load data: Training data should contain initial points and colors.
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+            )
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = Dataset(self.parser, split="val")
+            self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+            print("Scene scale:", self.scene_scale)
+        elif cfg.data_type == "blender":
+            from datasets.blender import Dataset
+
+            self.parser = None
+            self.trainset = Dataset(cfg.data_dir, split="train")
+            # using `test` over `val` for evaluation - following same convention as in https://nerfbaselines.github.io/
+            self.valset = Dataset(cfg.data_dir, split="test")
+            self.scene_scale = self.trainset.scene_scale * 1.1 * cfg.global_scale
+            print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -457,18 +461,6 @@ class Runner:
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
-        if cfg.lpips_net == "alex":
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="alex", normalize=True
-            ).to(self.device)
-        elif cfg.lpips_net == "vgg":
-            # The 3DGS official repo uses lpips vgg, which is equivalent with the following:
-            self.lpips = LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=False
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
-
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
@@ -478,6 +470,10 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+
+        self.fixed_bkgd = (
+            torch.tensor(cfg.bkgd_color, device=self.device)[None, :] / 255.0
+        )
 
     def rasterize_splats(
         self,
@@ -614,7 +610,7 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3 or 4]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -660,15 +656,37 @@ class Runner:
                     indexing="ij",
                 )
                 grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(
-                    self.bil_grids,
-                    grid_xy.expand(colors.shape[0], -1, -1, -1),
-                    colors,
-                    image_ids.unsqueeze(-1),
-                )["rgb"]
+                colors = slice(self.bil_grids, grid_xy, colors, image_ids)["rgb"]
+
+            gt_has_alpha = pixels.shape[-1] == 4
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
+            else:
+                bkgd = self.fixed_bkgd
+
+            if gt_has_alpha:
+                # we will apply the same background to both gt and render
+                # this encourages consistency between the gt image alpha
+                # and the render alpha (without adding any new losses)
+                # this works best with random_bkgd = True, as the transparent pixels
+                # in the source image will be a random color each iteration that the
+                # splat can only match by also being transparent
+                gt_alpha = pixels[..., [-1]]
+                gt_rgb = pixels[..., :3]
+
+                # per NeRFStudio logic - we assume the source image is not premultiplied
+                # see https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/models/splatfacto.py#L627
+                pixels = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
+
+                # likewise - we consider the render RGB to be premultiplied
+                # this follows existing logic in this script and also
+                # https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/models/splatfacto.py#L583
+                colors = colors + bkgd * (1.0 - alphas)
+            elif cfg.random_bkgd:
+                # random_bkgd is True but the source doesn't have alpha
+                # so we only apply the random background to the render colors
+                # this preserves the prior behavior ("to discourage transparaency")
                 colors = colors + bkgd * (1.0 - alphas)
 
             self.cfg.strategy.step_pre_backward(
@@ -709,7 +727,7 @@ class Runner:
                 loss += tvloss
 
             # regularizations
-            if cfg.opacity_reg > 0.0:
+            if cfg.opacity_reg > 0.0 and step > 10000:
                 loss = (
                     loss
                     + cfg.opacity_reg
@@ -720,6 +738,18 @@ class Runner:
                     loss
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
+            if cfg.aniso_reg > 0.0:
+                # Get the scales in 3D space
+                scales = torch.exp(self.splats["scales"])  # [N, 3]
+                # For each Gaussian, find the ratio between max and min scale
+                max_scales = scales.max(dim=1)[0]  # [N]
+                min_scales = scales.min(dim=1)[0]  # [N]
+                scale_ratios = max_scales / (min_scales + 1e-6)  # [N]
+                # Penalize ratios that exceed the maximum allowed ratio
+                aniso_loss = torch.clamp(
+                    scale_ratios - cfg.aniso_max_ratio, min=0.0
+                ).mean()
+                loss = loss + cfg.aniso_reg * aniso_loss
 
             loss.backward()
 
@@ -752,6 +782,8 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.aniso_reg > 0.0:
+                    self.writer.add_scalar("train/anisoloss", aniso_loss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -932,7 +964,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -945,8 +977,39 @@ class Runner:
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
-            colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
+            gt_has_alpha = pixels.shape[-1] == 4
+            if gt_has_alpha:
+                # We want to assess metrics with images composed on the fixed background
+                # But also prepare copies to write out with the alpha channel added normally (i.e. as RGBA)
+                bkgd = self.fixed_bkgd
+                gt_alpha = pixels[..., [-1]]
+                gt_rgb = pixels[..., :3]
+                # per NeRFStudio logic - we assume the source image is not premultiplied
+                # see https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/models/splatfacto.py#L627
+                eval_pixels = gt_rgb * gt_alpha + bkgd * (1 - gt_alpha)
+                # likewise - we consider the render RGB to be premultiplied
+                # this follows existing logic in this script and also
+                # https://github.com/nerfstudio-project/nerfstudio/blob/main/nerfstudio/models/splatfacto.py#L583
+                eval_colors = colors + bkgd * (1.0 - alphas)
+                image_pixels = pixels
+                image_colors = torch.cat([colors, alphas], dim=-1)
+                # Clamp to [0.0, 1.0]
+                # Image pixels don't need it because they are read directly from file
+                eval_colors = torch.clamp(eval_colors, 0.0, 1.0)
+                eval_pixels = torch.clamp(eval_pixels, 0.0, 1.0)
+                image_colors = torch.clamp(image_colors, 0.0, 1.0)
+            else:
+                # Because the source image does not have an alpha channel, we
+                # will simply use the same values for metrics and saving images
+                image_pixels = pixels
+                eval_pixels = pixels
+                # Clamp to [0.0, 1.0]
+                # Only colors need clamping, as the pixels are read directly from file
+                colors = torch.clamp(colors, 0.0, 1.0)
+                image_colors = colors
+                eval_colors = colors
+
+            canvas_list = [image_pixels, image_colors]
 
             if world_rank == 0:
                 # write images
@@ -957,11 +1020,10 @@ class Runner:
                     canvas,
                 )
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                pixels_p = eval_pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                colors_p = eval_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -979,19 +1041,11 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
-            if cfg.use_bilateral_grid:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
+            print(
+                f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f} "
+                f"Time: {stats['ellipse_time']:.3f}s/image "
+                f"Number of GS: {stats['num_GS']}"
+            )
             # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
@@ -1009,10 +1063,24 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        if self.parser is not None:
+            camtoworlds_all = self.parser.camtoworlds[5:-5]
+            K = (
+                torch.from_numpy(list(self.parser.Ks_dict.values())[0])
+                .float()
+                .to(device)
+            )
+            width, height = list(self.parser.imsize_dict.values())[0]
+        else:
+            camtoworlds_all = np.stack(
+                [elem.cpu().numpy() for elem in self.trainset.cam_to_worlds], axis=0
+            )
+            K = self.trainset.intrinsics.to(device)
+            width = self.trainset.image_width
+            height = self.trainset.image_height
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
+                camtoworlds_all, 5, rot_weight=1.0
             )  # [N, 3, 4]
         elif cfg.render_traj_path == "ellipse":
             height = camtoworlds_all[:, 2, 3].mean()
@@ -1041,8 +1109,6 @@ class Runner:
         )  # [N, 4, 4]
 
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
 
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
@@ -1170,6 +1236,23 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
+    if cfg.data_type == "blender":
+        print("Setting / overriding config settings for blender data")
+        print("Forcing init type to random")
+        cfg.init_type = "random"
+        print("Setting near and far to 0.1 and 100.0.")
+        # print(
+        #     "Setting near and far to Blender data recommended settings (2 and 6, respectively)"
+        # )
+        # Taken from nerfbaselines setting
+        cfg.near_plane = 0.1
+        cfg.far_plane = 100
+
+        if cfg.render_traj_path == "spiral":
+            print(
+                "Spiral render trajectory is not supported for blender data, setting to interp instead"
+            )
+            cfg.render_traj_path = "interp"
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
@@ -1230,39 +1313,5 @@ if __name__ == "__main__":
     }
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
-
-    # Import BilateralGrid and related functions based on configuration
-    if cfg.use_bilateral_grid or cfg.use_fused_bilagrid:
-        if cfg.use_fused_bilagrid:
-            cfg.use_bilateral_grid = True
-            from fused_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
-        else:
-            cfg.use_bilateral_grid = True
-            from lib_bilagrid import (
-                BilateralGrid,
-                color_correct,
-                slice,
-                total_variation_loss,
-            )
-
-    # try import extra dependencies
-    if cfg.compression == "png":
-        try:
-            import plas
-            import torchpq
-        except:
-            raise ImportError(
-                "To use PNG compression, you need to install "
-                "torchpq (instruction at https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install) "
-                "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
-            )
-
-    if cfg.with_ut:
-        assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
 
     cli(main, cfg, verbose=True)

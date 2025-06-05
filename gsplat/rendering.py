@@ -1526,10 +1526,9 @@ def rasterization_2dgs(
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
         colors = torch.cat((colors, depths[..., None]), dim=-1)
-
         if backgrounds is not None:
             backgrounds = torch.cat(
-                (backgrounds, torch.zeros_like(backgrounds[..., :1])), dim=-1
+                (backgrounds, torch.zeros((C, 1), device=colors.device)), dim=-1
             )
     elif render_mode in ["D", "ED"]:
         colors = depths[..., None]
